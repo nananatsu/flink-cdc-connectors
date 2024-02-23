@@ -23,16 +23,20 @@ import org.apache.flink.api.common.typeinfo.TypeInformation;
 import org.apache.flink.api.common.typeutils.base.LongSerializer;
 import org.apache.flink.api.java.typeutils.ResultTypeQueryable;
 import org.apache.flink.configuration.Configuration;
+import org.apache.flink.core.memory.MemorySegment;
+import org.apache.flink.core.memory.MemorySegmentFactory;
 import org.apache.flink.runtime.state.FunctionInitializationContext;
 import org.apache.flink.runtime.state.FunctionSnapshotContext;
 import org.apache.flink.streaming.api.checkpoint.CheckpointedFunction;
 import org.apache.flink.streaming.api.functions.source.RichParallelSourceFunction;
 import org.apache.flink.util.Collector;
+import org.apache.flink.util.MathUtils;
 import org.apache.flink.util.Preconditions;
 
 import org.apache.flink.shaded.guava31.com.google.common.util.concurrent.ThreadFactoryBuilder;
 
 import com.ververica.cdc.connectors.tidb.table.StartupMode;
+import com.ververica.cdc.connectors.tidb.table.utils.MurmurHashUtils;
 import com.ververica.cdc.connectors.tidb.table.utils.TableKeyRangeUtils;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -76,6 +80,8 @@ public class TiKVRichParallelSourceFunction<T> extends RichParallelSourceFunctio
     private final String database;
     private final String tableName;
 
+    private final Long tableId;
+
     /** Task local variables. */
     private transient TiSession session = null;
 
@@ -96,6 +102,13 @@ public class TiKVRichParallelSourceFunction<T> extends RichParallelSourceFunctio
 
     private static final long CLOSE_TIMEOUT = 30L;
 
+    // add for hash key to subtask, then drop record of other subtask
+    private int maxParallel;
+    private int parallel;
+    private int subtaskIndex;
+
+    private MemorySegment memorySegment;
+
     public TiKVRichParallelSourceFunction(
             TiKVSnapshotEventDeserializationSchema<T> snapshotEventDeserializationSchema,
             TiKVChangeEventDeserializationSchema<T> changeEventDeserializationSchema,
@@ -109,23 +122,36 @@ public class TiKVRichParallelSourceFunction<T> extends RichParallelSourceFunctio
         this.startupMode = startupMode;
         this.database = database;
         this.tableName = tableName;
-    }
 
-    @Override
-    public void open(final Configuration config) throws Exception {
-        super.open(config);
         session = TiSession.create(tiConf);
         TiTableInfo tableInfo = session.getCatalog().getTable(database, tableName);
         if (tableInfo == null) {
             throw new RuntimeException(
                     String.format("Table %s.%s does not exist.", database, tableName));
         }
-        long tableId = tableInfo.getId();
-        keyRange =
-                TableKeyRangeUtils.getTableKeyRange(
-                        tableId,
-                        getRuntimeContext().getNumberOfParallelSubtasks(),
-                        getRuntimeContext().getIndexOfThisSubtask());
+        tableId = tableInfo.getId();
+    }
+
+    @Override
+    public void open(final Configuration config) throws Exception {
+        super.open(config);
+        if (session == null) {
+            session = TiSession.create(tiConf);
+        }
+        //        session = TiSession.create(tiConf);
+        //        TiTableInfo tableInfo = session.getCatalog().getTable(database, tableName);
+        //        if (tableInfo == null) {
+        //            throw new RuntimeException(
+        //                    String.format("Table %s.%s does not exist.", database, tableName));
+        //        }
+        //        long tableId = tableInfo.getId();
+
+        keyRange = TableKeyRangeUtils.getTableKeyRange(tableId, 1, 0);
+        //        keyRange =
+        //                TableKeyRangeUtils.getTableKeyRange(
+        //                        tableId,
+        //                        getRuntimeContext().getNumberOfParallelSubtasks(),
+        //                        getRuntimeContext().getIndexOfThisSubtask());
         cdcClient = new CDCClient(session, keyRange);
         prewrites = new TreeMap<>();
         commits = new TreeMap<>();
@@ -145,6 +171,21 @@ public class TiKVRichParallelSourceFunction<T> extends RichParallelSourceFunctio
                                         + getRuntimeContext().getIndexOfThisSubtask())
                         .build();
         executorService = Executors.newSingleThreadExecutor(threadFactory);
+
+        maxParallel = getRuntimeContext().getMaxNumberOfParallelSubtasks();
+        parallel = getRuntimeContext().getNumberOfParallelSubtasks();
+        subtaskIndex = getRuntimeContext().getIndexOfThisSubtask();
+        memorySegment = MemorySegmentFactory.allocateUnpooledSegment(Long.BYTES * 2);
+    }
+
+    // check record is handled by this subtask
+    private boolean checkTargetPartition(byte[] rowKey) {
+        memorySegment.putLong(8, RowKey.decode(rowKey).getHandle());
+        int hashCode = MurmurHashUtils.hashBytesByWords(memorySegment, 0, Long.BYTES * 2);
+        int keyGroup = MathUtils.murmurHash(hashCode) % maxParallel;
+        int targetSubpartition = keyGroup * parallel / maxParallel;
+
+        return targetSubpartition == subtaskIndex;
     }
 
     @Override
@@ -168,7 +209,9 @@ public class TiKVRichParallelSourceFunction<T> extends RichParallelSourceFunctio
     }
 
     private void handleRow(final Cdcpb.Event.Row row) {
-        if (!TableKeyRangeUtils.isRecordKey(row.getKey().toByteArray())) {
+        byte[] rowKey = row.getKey().toByteArray();
+        if (!checkTargetPartition(rowKey) || !TableKeyRangeUtils.isRecordKey(rowKey)) {
+            //        if (!TableKeyRangeUtils.isRecordKey(row.getKey().toByteArray())) {
             // Don't handle index key for now
             return;
         }
@@ -207,7 +250,10 @@ public class TiKVRichParallelSourceFunction<T> extends RichParallelSourceFunctio
                 }
 
                 for (final Kvrpcpb.KvPair pair : segment) {
-                    if (TableKeyRangeUtils.isRecordKey(pair.getKey().toByteArray())) {
+                    byte[] rowKey = pair.getKey().toByteArray();
+                    if (checkTargetPartition(rowKey) && TableKeyRangeUtils.isRecordKey(rowKey)) {
+                        //                    if
+                        // (TableKeyRangeUtils.isRecordKey(pair.getKey().toByteArray())) {
                         snapshotEventDeserializationSchema.deserialize(pair, outputCollector);
                     }
                 }
