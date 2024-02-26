@@ -92,6 +92,10 @@ public class RowDataTiKVEventDeserializationSchemaBase implements Serializable {
         }
     }
 
+    public void updateTableInfo(TiTableInfo info) {
+        tableInfo = info;
+    }
+
     public void emit(
             TiKVMetadataConverter.TiKVRowValue inRecord,
             RowData physicalRow,

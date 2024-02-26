@@ -30,11 +30,14 @@ import org.apache.flink.runtime.state.FunctionSnapshotContext;
 import org.apache.flink.streaming.api.checkpoint.CheckpointedFunction;
 import org.apache.flink.streaming.api.functions.source.RichParallelSourceFunction;
 import org.apache.flink.util.Collector;
+import org.apache.flink.util.FlinkRuntimeException;
 import org.apache.flink.util.MathUtils;
 import org.apache.flink.util.Preconditions;
 
 import org.apache.flink.shaded.guava31.com.google.common.util.concurrent.ThreadFactoryBuilder;
 
+import com.ververica.cdc.connectors.tidb.table.RowDataTiKVChangeEventDeserializationSchema;
+import com.ververica.cdc.connectors.tidb.table.RowDataTiKVSnapshotEventDeserializationSchema;
 import com.ververica.cdc.connectors.tidb.table.StartupMode;
 import com.ververica.cdc.connectors.tidb.table.utils.MurmurHashUtils;
 import com.ververica.cdc.connectors.tidb.table.utils.TableKeyRangeUtils;
@@ -123,22 +126,32 @@ public class TiKVRichParallelSourceFunction<T> extends RichParallelSourceFunctio
         this.database = database;
         this.tableName = tableName;
 
-        session = TiSession.create(tiConf);
-        TiTableInfo tableInfo = session.getCatalog().getTable(database, tableName);
-        if (tableInfo == null) {
-            throw new RuntimeException(
-                    String.format("Table %s.%s does not exist.", database, tableName));
+        try (final TiSession session = TiSession.create(tiConf)) {
+            TiTableInfo tableInfo = session.getCatalog().getTable(database, tableName);
+            if (tableInfo == null) {
+                throw new RuntimeException(
+                        String.format("Table %s.%s does not exist.", database, tableName));
+            }
+            if (snapshotEventDeserializationSchema
+                    instanceof RowDataTiKVSnapshotEventDeserializationSchema) {
+                ((RowDataTiKVSnapshotEventDeserializationSchema) snapshotEventDeserializationSchema)
+                        .updateTableInfo(tableInfo);
+            }
+            if (changeEventDeserializationSchema
+                    instanceof RowDataTiKVChangeEventDeserializationSchema) {
+                ((RowDataTiKVChangeEventDeserializationSchema) changeEventDeserializationSchema)
+                        .updateTableInfo(tableInfo);
+            }
+            tableId = tableInfo.getId();
+        } catch (final Exception e) {
+            throw new FlinkRuntimeException(e);
         }
-        tableId = tableInfo.getId();
     }
 
     @Override
     public void open(final Configuration config) throws Exception {
         super.open(config);
-        if (session == null) {
-            session = TiSession.create(tiConf);
-        }
-        //        session = TiSession.create(tiConf);
+        session = TiSession.create(tiConf);
         //        TiTableInfo tableInfo = session.getCatalog().getTable(database, tableName);
         //        if (tableInfo == null) {
         //            throw new RuntimeException(
@@ -252,8 +265,7 @@ public class TiKVRichParallelSourceFunction<T> extends RichParallelSourceFunctio
                 for (final Kvrpcpb.KvPair pair : segment) {
                     byte[] rowKey = pair.getKey().toByteArray();
                     if (checkTargetPartition(rowKey) && TableKeyRangeUtils.isRecordKey(rowKey)) {
-                        //                    if
-                        // (TableKeyRangeUtils.isRecordKey(pair.getKey().toByteArray())) {
+                        // if (TableKeyRangeUtils.isRecordKey(pair.getKey().toByteArray())) {
                         snapshotEventDeserializationSchema.deserialize(pair, outputCollector);
                     }
                 }
