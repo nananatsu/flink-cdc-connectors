@@ -44,16 +44,22 @@ import com.ververica.cdc.connectors.tidb.table.utils.TableKeyRangeUtils;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.tikv.cdc.CDCClient;
+import org.tikv.common.PDClient;
 import org.tikv.common.TiConfiguration;
 import org.tikv.common.TiSession;
 import org.tikv.common.key.RowKey;
 import org.tikv.common.meta.TiTableInfo;
+import org.tikv.common.operation.PDErrorHandler;
+import org.tikv.common.util.ConcreteBackOffer;
 import org.tikv.kvproto.Cdcpb;
 import org.tikv.kvproto.Coprocessor;
 import org.tikv.kvproto.Kvrpcpb;
+import org.tikv.kvproto.PDGrpc;
+import org.tikv.kvproto.Pdpb;
 import org.tikv.shade.com.google.protobuf.ByteString;
 import org.tikv.txn.KVClient;
 
+import java.lang.reflect.Field;
 import java.util.List;
 import java.util.Objects;
 import java.util.TreeMap;
@@ -63,6 +69,9 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.TimeUnit;
+import java.util.function.Supplier;
+
+import static org.tikv.common.pd.PDError.buildFromPdpbError;
 
 /**
  * The source implementation for TiKV that read snapshot events first and then read the change
@@ -213,12 +222,39 @@ public class TiKVRichParallelSourceFunction<T> extends RichParallelSourceFunctio
         } else {
             LOG.info("Skip snapshot read");
             resolvedTs = session.getTimestamp().getVersion();
+            //            resolvedTs = getGcSafePoint();
         }
 
         LOG.info("start read change events");
         cdcClient.start(resolvedTs);
         running = true;
         readChangeEvents();
+    }
+
+    public long getGcSafePoint() throws NoSuchFieldException, IllegalAccessException {
+        PDClient client = session.getPDClient();
+        Field headerField = PDClient.class.getDeclaredField("header");
+        headerField.setAccessible(true);
+        Pdpb.RequestHeader header = (Pdpb.RequestHeader) headerField.get(client);
+
+        Supplier<Pdpb.GetGCSafePointRequest> request =
+                () -> Pdpb.GetGCSafePointRequest.newBuilder().setHeader(header).build();
+        PDErrorHandler<Pdpb.GetGCSafePointResponse> handler =
+                new PDErrorHandler<>(
+                        r ->
+                                r.getHeader().hasError()
+                                        ? buildFromPdpbError(r.getHeader().getError())
+                                        : null,
+                        session.getPDClient());
+
+        Pdpb.GetGCSafePointResponse resp =
+                client.callWithRetry(
+                        ConcreteBackOffer.newTsoBackOff(),
+                        PDGrpc.getGetGCSafePointMethod(),
+                        request,
+                        handler);
+
+        return resp.getSafePoint();
     }
 
     private void handleRow(final Cdcpb.Event.Row row) {
@@ -251,7 +287,8 @@ public class TiKVRichParallelSourceFunction<T> extends RichParallelSourceFunctio
     protected void readSnapshotEvents() throws Exception {
         LOG.info("read snapshot events");
         try (KVClient scanClient = session.createKVClient()) {
-            long startTs = session.getTimestamp().getVersion();
+            //            long startTs = session.getTimestamp().getVersion();
+            long startTs = getGcSafePoint();
             ByteString start = keyRange.getStart();
             while (true) {
                 final List<Kvrpcpb.KvPair> segment =
