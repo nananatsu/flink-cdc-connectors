@@ -74,11 +74,7 @@ public class RowDataTiKVChangeEventDeserializationSchema
                 break;
             case PUT:
                 try {
-                    tikvValues =
-                            decodeObjects(
-                                    row.getValue().toByteArray(),
-                                    RowKey.decode(row.getKey().toByteArray()).getHandle(),
-                                    tableInfo);
+                    tikvValues = decodeObjects(row.getValue().toByteArray(), handle, tableInfo);
                     if (row.getOldValue() == null || row.getOldValue().isEmpty()) {
                         RowData rowDataUpdateBefore =
                                 (RowData) physicalConverter.convert(tikvValues, tableInfo, null);

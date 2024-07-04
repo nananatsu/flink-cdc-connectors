@@ -29,6 +29,8 @@ import org.apache.flink.util.Collector;
 import org.apache.flink.util.FlinkRuntimeException;
 
 import com.ververica.cdc.debezium.utils.TemporalConversions;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.tikv.common.TiConfiguration;
 import org.tikv.common.TiSession;
 import org.tikv.common.meta.TiColumnInfo;
@@ -48,6 +50,9 @@ import static org.apache.flink.util.Preconditions.checkNotNull;
  */
 public class RowDataTiKVEventDeserializationSchemaBase implements Serializable {
     private static final long serialVersionUID = 1L;
+
+    private static final Logger LOG =
+            LoggerFactory.getLogger(RowDataTiKVEventDeserializationSchemaBase.class);
 
     /** Whether the deserializer needs to handle metadata columns. */
     private final boolean hasMetadata;

@@ -22,6 +22,8 @@ import org.apache.flink.table.types.logical.RowType;
 import org.apache.flink.util.Collector;
 
 import com.ververica.cdc.connectors.tidb.TiKVSnapshotEventDeserializationSchema;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.tikv.common.TiConfiguration;
 import org.tikv.common.key.RowKey;
 import org.tikv.kvproto.Kvrpcpb.KvPair;
@@ -38,6 +40,9 @@ public class RowDataTiKVSnapshotEventDeserializationSchema
         implements TiKVSnapshotEventDeserializationSchema<RowData> {
 
     private static final long serialVersionUID = 1L;
+
+    private static final Logger LOG =
+            LoggerFactory.getLogger(RowDataTiKVSnapshotEventDeserializationSchema.class);
 
     /** TypeInformation of the produced {@link RowData}. * */
     private final TypeInformation<RowData> resultTypeInfo;
@@ -63,12 +68,8 @@ public class RowDataTiKVSnapshotEventDeserializationSchema
         if (tableInfo == null) {
             tableInfo = fetchTableInfo();
         }
-        Object[] tikvValues =
-                decodeObjects(
-                        record.getValue().toByteArray(),
-                        RowKey.decode(record.getKey().toByteArray()).getHandle(),
-                        tableInfo);
-
+        long handle = RowKey.decode(record.getKey().toByteArray()).getHandle();
+        Object[] tikvValues = decodeObjects(record.getValue().toByteArray(), handle, tableInfo);
         emit(
                 new TiKVMetadataConverter.TiKVRowValue(record),
                 (RowData) physicalConverter.convert(tikvValues, tableInfo, null),

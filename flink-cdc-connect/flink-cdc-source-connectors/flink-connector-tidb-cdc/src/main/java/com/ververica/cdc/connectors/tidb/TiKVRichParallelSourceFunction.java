@@ -29,6 +29,7 @@ import org.apache.flink.runtime.state.FunctionInitializationContext;
 import org.apache.flink.runtime.state.FunctionSnapshotContext;
 import org.apache.flink.streaming.api.checkpoint.CheckpointedFunction;
 import org.apache.flink.streaming.api.functions.source.RichParallelSourceFunction;
+import org.apache.flink.table.data.binary.BinaryRowData;
 import org.apache.flink.util.Collector;
 import org.apache.flink.util.FlinkRuntimeException;
 import org.apache.flink.util.MathUtils;
@@ -39,6 +40,7 @@ import org.apache.flink.shaded.guava31.com.google.common.util.concurrent.ThreadF
 import com.ververica.cdc.connectors.tidb.table.RowDataTiKVChangeEventDeserializationSchema;
 import com.ververica.cdc.connectors.tidb.table.RowDataTiKVSnapshotEventDeserializationSchema;
 import com.ververica.cdc.connectors.tidb.table.StartupMode;
+import com.ververica.cdc.connectors.tidb.table.utils.BinaryWriterUtils;
 import com.ververica.cdc.connectors.tidb.table.utils.MurmurHashUtils;
 import com.ververica.cdc.connectors.tidb.table.utils.TableKeyRangeUtils;
 import org.slf4j.Logger;
@@ -47,9 +49,15 @@ import org.tikv.cdc.CDCClient;
 import org.tikv.common.PDClient;
 import org.tikv.common.TiConfiguration;
 import org.tikv.common.TiSession;
+import org.tikv.common.codec.CodecDataInput;
+import org.tikv.common.codec.RowDecoderV2;
+import org.tikv.common.codec.RowV2;
+import org.tikv.common.exception.CodecException;
 import org.tikv.common.key.RowKey;
+import org.tikv.common.meta.TiColumnInfo;
 import org.tikv.common.meta.TiTableInfo;
 import org.tikv.common.operation.PDErrorHandler;
+import org.tikv.common.types.IntegerType;
 import org.tikv.common.util.ConcreteBackOffer;
 import org.tikv.kvproto.Cdcpb;
 import org.tikv.kvproto.Coprocessor;
@@ -60,6 +68,8 @@ import org.tikv.shade.com.google.protobuf.ByteString;
 import org.tikv.txn.KVClient;
 
 import java.lang.reflect.Field;
+import java.nio.charset.StandardCharsets;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Objects;
 import java.util.TreeMap;
@@ -69,6 +79,7 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.TimeUnit;
+import java.util.function.BiFunction;
 import java.util.function.Supplier;
 
 import static org.tikv.common.pd.PDError.buildFromPdpbError;
@@ -92,8 +103,6 @@ public class TiKVRichParallelSourceFunction<T> extends RichParallelSourceFunctio
     private final String database;
     private final String tableName;
 
-    private final Long tableId;
-
     /** Task local variables. */
     private transient TiSession session = null;
 
@@ -114,12 +123,10 @@ public class TiKVRichParallelSourceFunction<T> extends RichParallelSourceFunctio
 
     private static final long CLOSE_TIMEOUT = 30L;
 
-    // add for hash key to subtask, then drop record of other subtask
-    private int maxParallel;
-    private int parallel;
-    private int subtaskIndex;
-
-    private MemorySegment memorySegment;
+    TiTableInfo tableInfo;
+    //    private final Long tableId;
+    protected transient BiFunction<Long, byte[], Boolean> checkPartition;
+    protected transient MemorySegment memorySegment;
 
     public TiKVRichParallelSourceFunction(
             TiKVSnapshotEventDeserializationSchema<T> snapshotEventDeserializationSchema,
@@ -136,7 +143,7 @@ public class TiKVRichParallelSourceFunction<T> extends RichParallelSourceFunctio
         this.tableName = tableName;
 
         try (final TiSession session = TiSession.create(tiConf)) {
-            TiTableInfo tableInfo = session.getCatalog().getTable(database, tableName);
+            tableInfo = session.getCatalog().getTable(database, tableName);
             if (tableInfo == null) {
                 throw new RuntimeException(
                         String.format("Table %s.%s does not exist.", database, tableName));
@@ -151,7 +158,7 @@ public class TiKVRichParallelSourceFunction<T> extends RichParallelSourceFunctio
                 ((RowDataTiKVChangeEventDeserializationSchema) changeEventDeserializationSchema)
                         .updateTableInfo(tableInfo);
             }
-            tableId = tableInfo.getId();
+            //            tableId = tableInfo.getId();
         } catch (final Exception e) {
             throw new FlinkRuntimeException(e);
         }
@@ -168,7 +175,7 @@ public class TiKVRichParallelSourceFunction<T> extends RichParallelSourceFunctio
         //        }
         //        long tableId = tableInfo.getId();
 
-        keyRange = TableKeyRangeUtils.getTableKeyRange(tableId, 1, 0);
+        keyRange = TableKeyRangeUtils.getTableKeyRange(tableInfo.getId(), 1, 0);
         //        keyRange =
         //                TableKeyRangeUtils.getTableKeyRange(
         //                        tableId,
@@ -194,20 +201,110 @@ public class TiKVRichParallelSourceFunction<T> extends RichParallelSourceFunctio
                         .build();
         executorService = Executors.newSingleThreadExecutor(threadFactory);
 
-        maxParallel = getRuntimeContext().getMaxNumberOfParallelSubtasks();
-        parallel = getRuntimeContext().getNumberOfParallelSubtasks();
-        subtaskIndex = getRuntimeContext().getIndexOfThisSubtask();
-        memorySegment = MemorySegmentFactory.allocateUnpooledSegment(Long.BYTES * 2);
-    }
+        // add for hash key to subtask, then drop record of other subtask
+        int maxParallel = getRuntimeContext().getMaxNumberOfParallelSubtasks();
+        int parallel = getRuntimeContext().getNumberOfParallelSubtasks();
+        int subtaskIndex = getRuntimeContext().getIndexOfThisSubtask();
 
-    // check record is handled by this subtask
-    private boolean checkTargetPartition(byte[] rowKey) {
-        memorySegment.putLong(8, RowKey.decode(rowKey).getHandle());
-        int hashCode = MurmurHashUtils.hashBytesByWords(memorySegment, 0, Long.BYTES * 2);
-        int keyGroup = MathUtils.murmurHash(hashCode) % maxParallel;
-        int targetSubpartition = keyGroup * parallel / maxParallel;
+        BiFunction<Long, byte[], Boolean> checkPartition;
+        if (!tableInfo.isPkHandle() && tableInfo.hasPrimaryKey()) {
+            memorySegment = MemorySegmentFactory.allocateUnpooledSegment(40);
+            try {
+                Field field = tableInfo.getClass().getDeclaredField("primaryKeyColumn");
+                field.setAccessible(true);
+                TiColumnInfo primaryColumn = ((TiColumnInfo) field.get(tableInfo));
+                //                final int offset = primaryColumn.getOffset();
+                final String colName = primaryColumn.getName();
 
-        return targetSubpartition == subtaskIndex;
+                checkPartition =
+                        (Long handle, byte[] values) -> {
+                            Object pk = getRowKey(values, handle, tableInfo, primaryColumn);
+                            if (pk == null) {
+                                throw new RuntimeException(
+                                        "primary column "
+                                                + colName
+                                                + " not exist in table "
+                                                + tableName);
+                            }
+                            if (pk instanceof String) {
+                                byte[] bytes = ((String) pk).getBytes(StandardCharsets.UTF_8);
+                                int len = bytes.length;
+
+                                int nullBitsSizeInBytes =
+                                        BinaryRowData.calculateBitSetWidthInBytes(1);
+                                int fieldOffset =
+                                        BinaryWriterUtils.getFieldOffset(nullBitsSizeInBytes, 0);
+
+                                //  writer.reset();
+                                int cursor =
+                                        BinaryWriterUtils.getFixedLengthPartSize(
+                                                nullBitsSizeInBytes, 1);
+                                for (int i = 0; i < nullBitsSizeInBytes; i += 8) {
+                                    memorySegment.putLong(i, 0L);
+                                }
+                                // BinaryFormat.MAX_FIX_PART_DATA_SIZE 7
+                                if (len <= 7) {
+                                    BinaryWriterUtils.writeBytesToFixLenPart(
+                                            memorySegment, fieldOffset, bytes, len);
+                                } else {
+                                    final int roundedSize =
+                                            BinaryWriterUtils.roundNumberOfBytesToNearestWord(len);
+
+                                    // ensureCapacity(roundedSize);
+                                    final int length = cursor + roundedSize;
+                                    if (memorySegment.size() < length) {
+                                        memorySegment =
+                                                BinaryWriterUtils.grow(memorySegment, length);
+                                    }
+
+                                    // zeroOutPaddingBytes(len);
+                                    if ((len & 0x07) > 0) {
+                                        memorySegment.putLong(cursor + ((len >> 3) << 3), 0L);
+                                    }
+
+                                    memorySegment.put(cursor, bytes, 0, len);
+
+                                    // setOffsetAndSize(pos, cursor, len);
+                                    final long offsetAndSize = ((long) cursor << 32) | len;
+                                    memorySegment.putLong(fieldOffset, offsetAndSize);
+                                }
+
+                                int hash = MurmurHashUtils.hashBytesByWords(memorySegment, 0, len);
+                                int keyGroup = MathUtils.murmurHash(hash) % maxParallel;
+                                int targetSubpartition = keyGroup * parallel / maxParallel;
+
+                                LOG.debug(
+                                        " PK: {} ,segment: {}  ,HashCode: {} ,KeyGroup: {} ,SubPartition: {} , SubtaskIndex: {} ,Drop: {}",
+                                        pk,
+                                        memorySegment.getArray(),
+                                        hash,
+                                        keyGroup,
+                                        targetSubpartition,
+                                        subtaskIndex,
+                                        targetSubpartition != subtaskIndex);
+                                return targetSubpartition == subtaskIndex;
+
+                            } else {
+                                throw new RuntimeException(
+                                        "primary column " + colName + " type not support");
+                            }
+                        };
+            } catch (NoSuchFieldException | IllegalAccessException e) {
+                throw new RuntimeException(e);
+            }
+        } else {
+            memorySegment = MemorySegmentFactory.allocateUnpooledSegment(Long.BYTES * 2);
+            checkPartition =
+                    (Long handle, byte[] values) -> {
+                        memorySegment.putLong(8, handle);
+                        int hash =
+                                MurmurHashUtils.hashBytesByWords(memorySegment, 0, Long.BYTES * 2);
+                        int keyGroup = MathUtils.murmurHash(hash) % maxParallel;
+                        int targetSubpartition = keyGroup * parallel / maxParallel;
+                        return targetSubpartition == subtaskIndex;
+                    };
+        }
+        this.checkPartition = checkPartition;
     }
 
     @Override
@@ -257,10 +354,56 @@ public class TiKVRichParallelSourceFunction<T> extends RichParallelSourceFunctio
         return resp.getSafePoint();
     }
 
+    private Object getRowKey(
+            byte[] value, Long handle, TiTableInfo tableInfo, TiColumnInfo primaryColumn) {
+        if (value.length == 0) {
+            throw new CodecException("Decode fails: value length is zero");
+        }
+        if (handle == null && tableInfo.isPkHandle()) {
+            throw new IllegalArgumentException("when pk is handle, handle cannot be null");
+        }
+        Object pk = null;
+        if ((value[0] & 0xff) == RowV2.CODEC_VER) {
+            // decode bytes
+            RowV2 rowV2 = RowV2.createNew(value);
+            RowV2.ColIDSearchResult searchResult = rowV2.findColID(primaryColumn.getId());
+
+            // corresponding column should be found
+            byte[] colData = rowV2.getData(searchResult.getIdx());
+            pk = RowDecoderV2.decodeCol(colData, primaryColumn.getType());
+            LOG.info("##### PK: {} ,Raw: {}", pk, colData);
+        } else {
+            // decode bytes
+            CodecDataInput cdi = new CodecDataInput(value);
+            if (primaryColumn.getId() == 1L) {
+                if (!cdi.eof()) {
+                    pk = primaryColumn.getType().decodeForBatchWrite(cdi);
+                }
+            } else {
+                int colSize = tableInfo.getColumns().size();
+                HashMap<Long, TiColumnInfo> idToColumn = new HashMap<>(colSize);
+                for (TiColumnInfo col : tableInfo.getColumns()) {
+                    idToColumn.put(col.getId(), col);
+                }
+                while (!cdi.eof()) {
+                    long colID = (long) IntegerType.BIGINT.decode(cdi);
+                    Object colValue = idToColumn.get(colID).getType().decodeForBatchWrite(cdi);
+                    if (colID == primaryColumn.getId()) {
+                        pk = colValue;
+                        break;
+                    }
+                }
+            }
+        }
+        return pk;
+    }
+
     private void handleRow(final Cdcpb.Event.Row row) {
         byte[] rowKey = row.getKey().toByteArray();
-        if (!checkTargetPartition(rowKey) || !TableKeyRangeUtils.isRecordKey(rowKey)) {
-            //        if (!TableKeyRangeUtils.isRecordKey(row.getKey().toByteArray())) {
+        if (!TableKeyRangeUtils.isRecordKey(rowKey)
+                || !checkPartition.apply(
+                        RowKey.decode(rowKey).getHandle(), row.getValue().toByteArray())) {
+            //            if (!TableKeyRangeUtils.isRecordKey(row.getKey().toByteArray())) {
             // Don't handle index key for now
             return;
         }
@@ -301,8 +444,12 @@ public class TiKVRichParallelSourceFunction<T> extends RichParallelSourceFunctio
 
                 for (final Kvrpcpb.KvPair pair : segment) {
                     byte[] rowKey = pair.getKey().toByteArray();
-                    if (checkTargetPartition(rowKey) && TableKeyRangeUtils.isRecordKey(rowKey)) {
-                        // if (TableKeyRangeUtils.isRecordKey(pair.getKey().toByteArray())) {
+                    if (!TableKeyRangeUtils.isRecordKey(rowKey)
+                            || !checkPartition.apply(
+                                    RowKey.decode(rowKey).getHandle(),
+                                    pair.getValue().toByteArray())) {
+                        //                        if
+                        // (TableKeyRangeUtils.isRecordKey(pair.getKey().toByteArray())) {
                         snapshotEventDeserializationSchema.deserialize(pair, outputCollector);
                     }
                 }
