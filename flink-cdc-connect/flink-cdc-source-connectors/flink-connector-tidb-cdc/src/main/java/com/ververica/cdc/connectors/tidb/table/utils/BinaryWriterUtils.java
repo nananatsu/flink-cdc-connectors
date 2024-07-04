@@ -17,14 +17,21 @@
 
 package com.ververica.cdc.connectors.tidb.table.utils;
 
+import org.apache.flink.api.java.tuple.Tuple2;
 import org.apache.flink.core.memory.MemorySegment;
 import org.apache.flink.core.memory.MemorySegmentFactory;
 import org.apache.flink.table.data.binary.BinaryRowData;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.nio.charset.StandardCharsets;
 import java.util.Arrays;
 
 /** copied from org.apache.flink.table.data.writer.AbstractBinaryWriter. */
 public class BinaryWriterUtils {
+
+    private static final Logger LOG = LoggerFactory.getLogger(BinaryWriterUtils.class);
 
     public static int getFixedLengthPartSize(int nullBitsSizeInBytes, int arity) {
         return nullBitsSizeInBytes + 8 * arity;
@@ -71,5 +78,55 @@ public class BinaryWriterUtils {
         segment = MemorySegmentFactory.wrap(Arrays.copyOf(segment.getArray(), newCapacity));
         //        afterGrow();
         return segment;
+    }
+
+    public static Tuple2<MemorySegment, Integer> writeMemorySegment(
+            MemorySegment memorySegment, String field) {
+        byte[] bytes = field.getBytes(StandardCharsets.UTF_8);
+        int len = bytes.length;
+
+        int nullBitsSizeInBytes = BinaryRowData.calculateBitSetWidthInBytes(1);
+        int fieldOffset = BinaryWriterUtils.getFieldOffset(nullBitsSizeInBytes, 0);
+        final int roundedSize = BinaryWriterUtils.roundNumberOfBytesToNearestWord(len);
+
+        //  writer.reset();
+        int cursor = BinaryWriterUtils.getFixedLengthPartSize(nullBitsSizeInBytes, 1);
+        if (memorySegment == null) {
+            memorySegment = MemorySegmentFactory.allocateUnpooledSegment(cursor + roundedSize);
+        }
+        for (int i = 0; i < nullBitsSizeInBytes; i += 8) {
+            memorySegment.putLong(i, 0L);
+        }
+
+        // BinaryFormat.MAX_FIX_PART_DATA_SIZE 7
+        int length;
+        if (len <= 7) {
+            BinaryWriterUtils.writeBytesToFixLenPart(memorySegment, fieldOffset, bytes, len);
+            length = fieldOffset + 8;
+        } else {
+            // ensureCapacity(roundedSize);
+            length = cursor + roundedSize;
+            if (memorySegment.size() < length) {
+                memorySegment = BinaryWriterUtils.grow(memorySegment, length);
+            }
+
+            // zeroOutPaddingBytes(len);
+            if ((len & 0x07) > 0) {
+                memorySegment.putLong(cursor + ((len >> 3) << 3), 0L);
+            }
+            memorySegment.put(cursor, bytes, 0, len);
+
+            // setOffsetAndSize(pos, cursor, len);
+            final long offsetAndSize = ((long) cursor << 32) | len;
+            memorySegment.putLong(fieldOffset, offsetAndSize);
+        }
+        return Tuple2.of(memorySegment, length);
+    }
+
+    public static BinaryRowData wrapBinaryRowData(String field) {
+        Tuple2<MemorySegment, Integer> segment = BinaryWriterUtils.writeMemorySegment(null, field);
+        BinaryRowData row = new BinaryRowData(1);
+        row.pointTo(segment.f0, 0, segment.f1);
+        return row;
     }
 }

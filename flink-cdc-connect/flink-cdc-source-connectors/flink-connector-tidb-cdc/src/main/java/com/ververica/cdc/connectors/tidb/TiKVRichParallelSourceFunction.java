@@ -21,6 +21,7 @@ import org.apache.flink.api.common.state.ListState;
 import org.apache.flink.api.common.state.ListStateDescriptor;
 import org.apache.flink.api.common.typeinfo.TypeInformation;
 import org.apache.flink.api.common.typeutils.base.LongSerializer;
+import org.apache.flink.api.java.tuple.Tuple2;
 import org.apache.flink.api.java.typeutils.ResultTypeQueryable;
 import org.apache.flink.configuration.Configuration;
 import org.apache.flink.core.memory.MemorySegment;
@@ -29,7 +30,6 @@ import org.apache.flink.runtime.state.FunctionInitializationContext;
 import org.apache.flink.runtime.state.FunctionSnapshotContext;
 import org.apache.flink.streaming.api.checkpoint.CheckpointedFunction;
 import org.apache.flink.streaming.api.functions.source.RichParallelSourceFunction;
-import org.apache.flink.table.data.binary.BinaryRowData;
 import org.apache.flink.util.Collector;
 import org.apache.flink.util.FlinkRuntimeException;
 import org.apache.flink.util.MathUtils;
@@ -68,7 +68,6 @@ import org.tikv.shade.com.google.protobuf.ByteString;
 import org.tikv.txn.KVClient;
 
 import java.lang.reflect.Field;
-import java.nio.charset.StandardCharsets;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Objects;
@@ -227,56 +226,24 @@ public class TiKVRichParallelSourceFunction<T> extends RichParallelSourceFunctio
                                                 + tableName);
                             }
                             if (pk instanceof String) {
-                                byte[] bytes = ((String) pk).getBytes(StandardCharsets.UTF_8);
-                                int len = bytes.length;
-
-                                int nullBitsSizeInBytes =
-                                        BinaryRowData.calculateBitSetWidthInBytes(1);
-                                int fieldOffset =
-                                        BinaryWriterUtils.getFieldOffset(nullBitsSizeInBytes, 0);
-
-                                //  writer.reset();
-                                int cursor =
-                                        BinaryWriterUtils.getFixedLengthPartSize(
-                                                nullBitsSizeInBytes, 1);
-                                for (int i = 0; i < nullBitsSizeInBytes; i += 8) {
-                                    memorySegment.putLong(i, 0L);
+                                Tuple2<MemorySegment, Integer> segment =
+                                        BinaryWriterUtils.writeMemorySegment(
+                                                memorySegment, (String) pk);
+                                if (segment.f0.size() > memorySegment.size()) {
+                                    memorySegment = segment.f0;
                                 }
-                                // BinaryFormat.MAX_FIX_PART_DATA_SIZE 7
-                                if (len <= 7) {
-                                    BinaryWriterUtils.writeBytesToFixLenPart(
-                                            memorySegment, fieldOffset, bytes, len);
-                                } else {
-                                    final int roundedSize =
-                                            BinaryWriterUtils.roundNumberOfBytesToNearestWord(len);
-
-                                    // ensureCapacity(roundedSize);
-                                    final int length = cursor + roundedSize;
-                                    if (memorySegment.size() < length) {
-                                        memorySegment =
-                                                BinaryWriterUtils.grow(memorySegment, length);
-                                    }
-
-                                    // zeroOutPaddingBytes(len);
-                                    if ((len & 0x07) > 0) {
-                                        memorySegment.putLong(cursor + ((len >> 3) << 3), 0L);
-                                    }
-
-                                    memorySegment.put(cursor, bytes, 0, len);
-
-                                    // setOffsetAndSize(pos, cursor, len);
-                                    final long offsetAndSize = ((long) cursor << 32) | len;
-                                    memorySegment.putLong(fieldOffset, offsetAndSize);
-                                }
-
-                                int hash = MurmurHashUtils.hashBytesByWords(memorySegment, 0, len);
+                                int hash =
+                                        MurmurHashUtils.hashBytesByWords(segment.f0, 0, segment.f1);
                                 int keyGroup = MathUtils.murmurHash(hash) % maxParallel;
                                 int targetSubpartition = keyGroup * parallel / maxParallel;
 
+                                byte[] bytes = new byte[segment.f1];
+                                memorySegment.get(0, bytes);
                                 LOG.debug(
-                                        " PK: {} ,segment: {}  ,HashCode: {} ,KeyGroup: {} ,SubPartition: {} , SubtaskIndex: {} ,Drop: {}",
+                                        "table: {} ,PK: {} ,segment: {}  ,HashCode: {} ,KeyGroup: {} ,SubPartition: {} , SubtaskIndex: {} ,Drop: {}",
+                                        tableName,
                                         pk,
-                                        memorySegment.getArray(),
+                                        bytes,
                                         hash,
                                         keyGroup,
                                         targetSubpartition,
@@ -371,7 +338,6 @@ public class TiKVRichParallelSourceFunction<T> extends RichParallelSourceFunctio
             // corresponding column should be found
             byte[] colData = rowV2.getData(searchResult.getIdx());
             pk = RowDecoderV2.decodeCol(colData, primaryColumn.getType());
-            LOG.info("##### PK: {} ,Raw: {}", pk, colData);
         } else {
             // decode bytes
             CodecDataInput cdi = new CodecDataInput(value);
