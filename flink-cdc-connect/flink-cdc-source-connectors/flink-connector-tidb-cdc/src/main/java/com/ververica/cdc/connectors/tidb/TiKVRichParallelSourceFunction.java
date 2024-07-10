@@ -30,6 +30,7 @@ import org.apache.flink.runtime.state.FunctionInitializationContext;
 import org.apache.flink.runtime.state.FunctionSnapshotContext;
 import org.apache.flink.streaming.api.checkpoint.CheckpointedFunction;
 import org.apache.flink.streaming.api.functions.source.RichParallelSourceFunction;
+import org.apache.flink.table.data.binary.BinaryRowData;
 import org.apache.flink.util.Collector;
 import org.apache.flink.util.FlinkRuntimeException;
 import org.apache.flink.util.MathUtils;
@@ -207,7 +208,7 @@ public class TiKVRichParallelSourceFunction<T> extends RichParallelSourceFunctio
 
         BiFunction<Long, byte[], Boolean> checkPartition;
         if (!tableInfo.isPkHandle() && tableInfo.hasPrimaryKey()) {
-            memorySegment = MemorySegmentFactory.allocateUnpooledSegment(40);
+            memorySegment = MemorySegmentFactory.allocateUnpooledSegment(64);
             try {
                 Field field = tableInfo.getClass().getDeclaredField("primaryKeyColumn");
                 field.setAccessible(true);
@@ -237,20 +238,17 @@ public class TiKVRichParallelSourceFunction<T> extends RichParallelSourceFunctio
                                 int keyGroup = MathUtils.murmurHash(hash) % maxParallel;
                                 int targetSubpartition = keyGroup * parallel / maxParallel;
 
-                                byte[] bytes = new byte[segment.f1];
-                                memorySegment.get(0, bytes);
                                 LOG.debug(
-                                        "table: {} ,PK: {} ,segment: {}  ,HashCode: {} ,KeyGroup: {} ,SubPartition: {} , SubtaskIndex: {} ,Drop: {}",
+                                        "table: {} ,PK: {} ,HashCode: {} ,KeyGroup: {} ,SubPartition: {} , SubtaskIndex: {}=={},Drop: {}",
                                         tableName,
                                         pk,
-                                        bytes,
                                         hash,
                                         keyGroup,
                                         targetSubpartition,
                                         subtaskIndex,
+                                        getRuntimeContext().getIndexOfThisSubtask(),
                                         targetSubpartition != subtaskIndex);
                                 return targetSubpartition == subtaskIndex;
-
                             } else {
                                 throw new RuntimeException(
                                         "primary column " + colName + " type not support");
@@ -263,9 +261,13 @@ public class TiKVRichParallelSourceFunction<T> extends RichParallelSourceFunctio
             memorySegment = MemorySegmentFactory.allocateUnpooledSegment(Long.BYTES * 2);
             checkPartition =
                     (Long handle, byte[] values) -> {
-                        memorySegment.putLong(8, handle);
+                        int fieldOffset =
+                                BinaryWriterUtils.getFieldOffset(
+                                        BinaryRowData.calculateBitSetWidthInBytes(1), 0);
+
+                        memorySegment.putLong(fieldOffset, handle);
                         int hash =
-                                MurmurHashUtils.hashBytesByWords(memorySegment, 0, Long.BYTES * 2);
+                                MurmurHashUtils.hashBytesByWords(memorySegment, 0, fieldOffset + 8);
                         int keyGroup = MathUtils.murmurHash(hash) % maxParallel;
                         int targetSubpartition = keyGroup * parallel / maxParallel;
                         return targetSubpartition == subtaskIndex;
@@ -410,8 +412,8 @@ public class TiKVRichParallelSourceFunction<T> extends RichParallelSourceFunctio
 
                 for (final Kvrpcpb.KvPair pair : segment) {
                     byte[] rowKey = pair.getKey().toByteArray();
-                    if (!TableKeyRangeUtils.isRecordKey(rowKey)
-                            || !checkPartition.apply(
+                    if (TableKeyRangeUtils.isRecordKey(rowKey)
+                            && checkPartition.apply(
                                     RowKey.decode(rowKey).getHandle(),
                                     pair.getValue().toByteArray())) {
                         //                        if

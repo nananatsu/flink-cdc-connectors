@@ -87,27 +87,35 @@ public class BinaryWriterUtils {
 
         int nullBitsSizeInBytes = BinaryRowData.calculateBitSetWidthInBytes(1);
         int fieldOffset = BinaryWriterUtils.getFieldOffset(nullBitsSizeInBytes, 0);
-        final int roundedSize = BinaryWriterUtils.roundNumberOfBytesToNearestWord(len);
-
-        //  writer.reset();
         int cursor = BinaryWriterUtils.getFixedLengthPartSize(nullBitsSizeInBytes, 1);
-        if (memorySegment == null) {
-            memorySegment = MemorySegmentFactory.allocateUnpooledSegment(cursor + roundedSize);
-        }
-        for (int i = 0; i < nullBitsSizeInBytes; i += 8) {
-            memorySegment.putLong(i, 0L);
-        }
+        int length;
 
         // BinaryFormat.MAX_FIX_PART_DATA_SIZE 7
-        int length;
         if (len <= 7) {
-            BinaryWriterUtils.writeBytesToFixLenPart(memorySegment, fieldOffset, bytes, len);
             length = fieldOffset + 8;
+            if (memorySegment == null) {
+                memorySegment = MemorySegmentFactory.allocateUnpooledSegment(length);
+            }
+
+            //  writer.reset();
+            for (int i = 0; i < nullBitsSizeInBytes; i += 8) {
+                memorySegment.putLong(i, 0L);
+            }
+            BinaryWriterUtils.writeBytesToFixLenPart(memorySegment, fieldOffset, bytes, len);
+
         } else {
+            final int roundedSize = BinaryWriterUtils.roundNumberOfBytesToNearestWord(len);
             // ensureCapacity(roundedSize);
             length = cursor + roundedSize;
-            if (memorySegment.size() < length) {
+            if (memorySegment == null) {
+                memorySegment = MemorySegmentFactory.allocateUnpooledSegment(length);
+            } else if (memorySegment.size() < length) {
                 memorySegment = BinaryWriterUtils.grow(memorySegment, length);
+            }
+
+            //  writer.reset();
+            for (int i = 0; i < nullBitsSizeInBytes; i += 8) {
+                memorySegment.putLong(i, 0L);
             }
 
             // zeroOutPaddingBytes(len);
@@ -121,12 +129,5 @@ public class BinaryWriterUtils {
             memorySegment.putLong(fieldOffset, offsetAndSize);
         }
         return Tuple2.of(memorySegment, length);
-    }
-
-    public static BinaryRowData wrapBinaryRowData(String field) {
-        Tuple2<MemorySegment, Integer> segment = BinaryWriterUtils.writeMemorySegment(null, field);
-        BinaryRowData row = new BinaryRowData(1);
-        row.pointTo(segment.f0, 0, segment.f1);
-        return row;
     }
 }
