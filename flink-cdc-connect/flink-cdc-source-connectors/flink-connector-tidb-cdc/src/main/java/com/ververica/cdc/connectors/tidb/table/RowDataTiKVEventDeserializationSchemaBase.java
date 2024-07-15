@@ -18,16 +18,20 @@ package com.ververica.cdc.connectors.tidb.table;
 
 import org.apache.flink.table.data.DecimalData;
 import org.apache.flink.table.data.GenericArrayData;
+import org.apache.flink.table.data.GenericMapData;
 import org.apache.flink.table.data.GenericRowData;
 import org.apache.flink.table.data.RowData;
 import org.apache.flink.table.data.StringData;
 import org.apache.flink.table.data.TimestampData;
 import org.apache.flink.table.types.logical.DecimalType;
 import org.apache.flink.table.types.logical.LogicalType;
+import org.apache.flink.table.types.logical.LogicalTypeRoot;
 import org.apache.flink.table.types.logical.RowType;
 import org.apache.flink.util.Collector;
 import org.apache.flink.util.FlinkRuntimeException;
 
+import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import com.ververica.cdc.debezium.utils.TemporalConversions;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -41,6 +45,8 @@ import java.io.Serializable;
 import java.math.BigDecimal;
 import java.nio.ByteBuffer;
 import java.sql.Timestamp;
+import java.util.List;
+import java.util.Map;
 
 import static org.apache.flink.util.Preconditions.checkNotNull;
 
@@ -206,6 +212,36 @@ public class RowDataTiKVEventDeserializationSchemaBase implements Serializable {
             case ROW:
                 return createRowConverter((RowType) type);
             case ARRAY:
+                LogicalType elementType = type.getChildren().get(0);
+                if (elementType.is(LogicalTypeRoot.MAP)) {
+                    List<LogicalType> mapElementType = elementType.getChildren();
+                    switch (mapElementType.get(1).getTypeRoot()) {
+                        case VARCHAR:
+                            ObjectMapper mapper = new ObjectMapper();
+                            return new TiKVDeserializationRuntimeConverter() {
+                                private static final long serialVersionUID = 1L;
+
+                                @Override
+                                public Object convert(
+                                        Object object,
+                                        TiTableInfo tableInfo,
+                                        org.tikv.common.types.DataType dataType)
+                                        throws Exception {
+                                    return new GenericArrayData(
+                                            mapper
+                                                    .readValue(
+                                                            (String) object,
+                                                            new TypeReference<
+                                                                    List<Map<String, String>>>() {})
+                                                    .stream()
+                                                    .map(GenericMapData::new)
+                                                    .toArray(GenericMapData[]::new));
+                                }
+                            };
+                        default:
+                            throw new UnsupportedOperationException("Unsupported type: " + type);
+                    }
+                }
                 return new TiKVDeserializationRuntimeConverter() {
 
                     private static final long serialVersionUID = 1L;
@@ -225,6 +261,29 @@ public class RowDataTiKVEventDeserializationSchemaBase implements Serializable {
                     }
                 };
             case MAP:
+                List<LogicalType> mapElementType = type.getChildren();
+                switch (mapElementType.get(1).getTypeRoot()) {
+                    case VARCHAR:
+                        ObjectMapper mapper = new ObjectMapper();
+
+                        return new TiKVDeserializationRuntimeConverter() {
+                            private static final long serialVersionUID = 1L;
+
+                            @Override
+                            public Object convert(
+                                    Object object,
+                                    TiTableInfo tableInfo,
+                                    org.tikv.common.types.DataType dataType)
+                                    throws Exception {
+                                return new GenericMapData(
+                                        mapper.readValue(
+                                                (String) object,
+                                                new TypeReference<Map<String, String>>() {}));
+                            }
+                        };
+                    default:
+                        throw new UnsupportedOperationException("Unsupported type: " + type);
+                }
             case MULTISET:
             case RAW:
             default:

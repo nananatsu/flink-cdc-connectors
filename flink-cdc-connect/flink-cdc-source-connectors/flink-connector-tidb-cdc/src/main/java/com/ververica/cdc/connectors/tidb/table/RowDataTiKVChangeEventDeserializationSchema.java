@@ -60,13 +60,29 @@ public class RowDataTiKVChangeEventDeserializationSchema
         if (tableInfo == null) {
             tableInfo = fetchTableInfo();
         }
-        final RowKey rowKey = RowKey.decode(row.getKey().toByteArray());
-        final long handle = rowKey.getHandle();
-        Object[] tikvValues;
 
+        //        final RowKey rowKey = RowKey.decode(row.getKey().toByteArray());
+        //        final long handle = rowKey.getHandle();
+        RowKey.Handle handle =
+                RowKey.decodeHandle(row.getKey().toByteArray(), tableInfo.isCommonHandle());
+        Object[] tikvValues;
         switch (row.getOpType()) {
             case DELETE:
-                tikvValues = decodeObjects(row.getOldValue().toByteArray(), handle, tableInfo);
+                //                tikvValues = decodeObjects(row.getOldValue().toByteArray(),
+                // handle, tableInfo);
+                if (handle.getIsCommonHandle()) {
+                    tikvValues =
+                            decodeObjects(
+                                    row.getOldValue().toByteArray(),
+                                    handle.getStringHandle(),
+                                    tableInfo);
+                } else {
+                    tikvValues =
+                            decodeObjects(
+                                    row.getOldValue().toByteArray(),
+                                    handle.getLongHandle(),
+                                    tableInfo);
+                }
                 RowData rowDataDelete =
                         (RowData) physicalConverter.convert(tikvValues, tableInfo, null);
                 rowDataDelete.setRowKind(RowKind.DELETE);
@@ -74,7 +90,22 @@ public class RowDataTiKVChangeEventDeserializationSchema
                 break;
             case PUT:
                 try {
-                    tikvValues = decodeObjects(row.getValue().toByteArray(), handle, tableInfo);
+                    //                    tikvValues = decodeObjects(row.getValue().toByteArray(),
+                    // handle, tableInfo);
+                    if (handle.getIsCommonHandle()) {
+                        tikvValues =
+                                decodeObjects(
+                                        row.getValue().toByteArray(),
+                                        handle.getStringHandle(),
+                                        tableInfo);
+                    } else {
+                        tikvValues =
+                                decodeObjects(
+                                        row.getValue().toByteArray(),
+                                        handle.getLongHandle(),
+                                        tableInfo);
+                    }
+
                     if (row.getOldValue() == null || row.getOldValue().isEmpty()) {
                         RowData rowDataUpdateBefore =
                                 (RowData) physicalConverter.convert(tikvValues, tableInfo, null);

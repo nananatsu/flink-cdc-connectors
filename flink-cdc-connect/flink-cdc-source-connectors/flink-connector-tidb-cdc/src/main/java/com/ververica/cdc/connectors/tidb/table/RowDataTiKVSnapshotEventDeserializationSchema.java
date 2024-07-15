@@ -68,8 +68,19 @@ public class RowDataTiKVSnapshotEventDeserializationSchema
         if (tableInfo == null) {
             tableInfo = fetchTableInfo();
         }
-        long handle = RowKey.decode(record.getKey().toByteArray()).getHandle();
-        Object[] tikvValues = decodeObjects(record.getValue().toByteArray(), handle, tableInfo);
+        RowKey.Handle handle =
+                RowKey.decodeHandle(record.getKey().toByteArray(), tableInfo.isCommonHandle());
+
+        Object[] tikvValues;
+        if (handle.getIsCommonHandle()) {
+            tikvValues =
+                    decodeObjects(
+                            record.getValue().toByteArray(), handle.getStringHandle(), tableInfo);
+        } else {
+            tikvValues =
+                    decodeObjects(
+                            record.getValue().toByteArray(), handle.getLongHandle(), tableInfo);
+        }
         emit(
                 new TiKVMetadataConverter.TiKVRowValue(record),
                 (RowData) physicalConverter.convert(tikvValues, tableInfo, null),

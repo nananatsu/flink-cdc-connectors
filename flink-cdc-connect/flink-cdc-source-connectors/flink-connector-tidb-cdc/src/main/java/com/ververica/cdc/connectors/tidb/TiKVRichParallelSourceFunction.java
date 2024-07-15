@@ -30,7 +30,6 @@ import org.apache.flink.runtime.state.FunctionInitializationContext;
 import org.apache.flink.runtime.state.FunctionSnapshotContext;
 import org.apache.flink.streaming.api.checkpoint.CheckpointedFunction;
 import org.apache.flink.streaming.api.functions.source.RichParallelSourceFunction;
-import org.apache.flink.table.data.binary.BinaryRowData;
 import org.apache.flink.util.Collector;
 import org.apache.flink.util.FlinkRuntimeException;
 import org.apache.flink.util.MathUtils;
@@ -50,15 +49,10 @@ import org.tikv.cdc.CDCClient;
 import org.tikv.common.PDClient;
 import org.tikv.common.TiConfiguration;
 import org.tikv.common.TiSession;
-import org.tikv.common.codec.CodecDataInput;
-import org.tikv.common.codec.RowDecoderV2;
-import org.tikv.common.codec.RowV2;
-import org.tikv.common.exception.CodecException;
 import org.tikv.common.key.RowKey;
 import org.tikv.common.meta.TiColumnInfo;
 import org.tikv.common.meta.TiTableInfo;
 import org.tikv.common.operation.PDErrorHandler;
-import org.tikv.common.types.IntegerType;
 import org.tikv.common.util.ConcreteBackOffer;
 import org.tikv.kvproto.Cdcpb;
 import org.tikv.kvproto.Coprocessor;
@@ -69,7 +63,6 @@ import org.tikv.shade.com.google.protobuf.ByteString;
 import org.tikv.txn.KVClient;
 
 import java.lang.reflect.Field;
-import java.util.HashMap;
 import java.util.List;
 import java.util.Objects;
 import java.util.TreeMap;
@@ -125,7 +118,7 @@ public class TiKVRichParallelSourceFunction<T> extends RichParallelSourceFunctio
 
     TiTableInfo tableInfo;
     //    private final Long tableId;
-    protected transient BiFunction<Long, byte[], Boolean> checkPartition;
+    protected transient BiFunction<RowKey.Handle, byte[], Boolean> checkPartition;
     protected transient MemorySegment memorySegment;
 
     public TiKVRichParallelSourceFunction(
@@ -206,7 +199,8 @@ public class TiKVRichParallelSourceFunction<T> extends RichParallelSourceFunctio
         int parallel = getRuntimeContext().getNumberOfParallelSubtasks();
         int subtaskIndex = getRuntimeContext().getIndexOfThisSubtask();
 
-        BiFunction<Long, byte[], Boolean> checkPartition;
+        BiFunction<RowKey.Handle, byte[], Boolean> checkPartition;
+
         if (!tableInfo.isPkHandle() && tableInfo.hasPrimaryKey()) {
             memorySegment = MemorySegmentFactory.allocateUnpooledSegment(64);
             try {
@@ -217,42 +211,58 @@ public class TiKVRichParallelSourceFunction<T> extends RichParallelSourceFunctio
                 final String colName = primaryColumn.getName();
 
                 checkPartition =
-                        (Long handle, byte[] values) -> {
-                            Object pk = getRowKey(values, handle, tableInfo, primaryColumn);
-                            if (pk == null) {
-                                throw new RuntimeException(
-                                        "primary column "
-                                                + colName
-                                                + " not exist in table "
-                                                + tableName);
-                            }
-                            if (pk instanceof String) {
-                                Tuple2<MemorySegment, Integer> segment =
-                                        BinaryWriterUtils.writeMemorySegment(
-                                                memorySegment, (String) pk);
-                                if (segment.f0.size() > memorySegment.size()) {
-                                    memorySegment = segment.f0;
+                        (RowKey.Handle key, byte[] values) -> {
+                            Object pk;
+                            int hash;
+                            // tidb 8.0 clustered index pk not exist in row
+                            // key contains pk
+                            if (key.getIsCommonHandle()) {
+                                pk = key.getStringHandle();
+                                key.setMemorySegment(memorySegment);
+                                hash = key.hashCode();
+                                if (key.getMemorySegment().size() > memorySegment.size()) {
+                                    memorySegment = key.getMemorySegment();
                                 }
-                                int hash =
-                                        MurmurHashUtils.hashBytesByWords(segment.f0, 0, segment.f1);
-                                int keyGroup = MathUtils.murmurHash(hash) % maxParallel;
-                                int targetSubpartition = keyGroup * parallel / maxParallel;
-
-                                LOG.debug(
-                                        "table: {} ,PK: {} ,HashCode: {} ,KeyGroup: {} ,SubPartition: {} , SubtaskIndex: {}=={},Drop: {}",
-                                        tableName,
-                                        pk,
-                                        hash,
-                                        keyGroup,
-                                        targetSubpartition,
-                                        subtaskIndex,
-                                        getRuntimeContext().getIndexOfThisSubtask(),
-                                        targetSubpartition != subtaskIndex);
-                                return targetSubpartition == subtaskIndex;
                             } else {
-                                throw new RuntimeException(
-                                        "primary column " + colName + " type not support");
+                                pk = RowKey.getRowPK(values, tableInfo, primaryColumn);
+                                if (pk == null) {
+                                    throw new RuntimeException(
+                                            "primary column "
+                                                    + colName
+                                                    + " not exist in table"
+                                                    + tableName);
+                                }
+
+                                if (pk instanceof String) {
+                                    Tuple2<MemorySegment, Integer> segment =
+                                            BinaryWriterUtils.writeMemorySegment(
+                                                    memorySegment, (String) pk);
+                                    if (segment.f0.size() > memorySegment.size()) {
+                                        memorySegment = segment.f0;
+                                    }
+                                    hash =
+                                            MurmurHashUtils.hashBytesByWords(
+                                                    segment.f0, 0, segment.f1);
+                                } else {
+                                    throw new RuntimeException(
+                                            "primary column " + colName + " type not support");
+                                }
                             }
+
+                            int keyGroup = MathUtils.murmurHash(hash) % maxParallel;
+                            int targetSubpartition = keyGroup * parallel / maxParallel;
+
+                            LOG.debug(
+                                    "table: {} ,PK: {} ,HashCode: {} ,KeyGroup: {} ,SubPartition: {} , SubtaskIndex: {}=={},Drop: {}",
+                                    tableName,
+                                    pk,
+                                    hash,
+                                    keyGroup,
+                                    targetSubpartition,
+                                    subtaskIndex,
+                                    getRuntimeContext().getIndexOfThisSubtask(),
+                                    targetSubpartition != subtaskIndex);
+                            return targetSubpartition == subtaskIndex;
                         };
             } catch (NoSuchFieldException | IllegalAccessException e) {
                 throw new RuntimeException(e);
@@ -260,14 +270,9 @@ public class TiKVRichParallelSourceFunction<T> extends RichParallelSourceFunctio
         } else {
             memorySegment = MemorySegmentFactory.allocateUnpooledSegment(Long.BYTES * 2);
             checkPartition =
-                    (Long handle, byte[] values) -> {
-                        int fieldOffset =
-                                BinaryWriterUtils.getFieldOffset(
-                                        BinaryRowData.calculateBitSetWidthInBytes(1), 0);
-
-                        memorySegment.putLong(fieldOffset, handle);
-                        int hash =
-                                MurmurHashUtils.hashBytesByWords(memorySegment, 0, fieldOffset + 8);
+                    (RowKey.Handle key, byte[] values) -> {
+                        key.setMemorySegment(memorySegment);
+                        int hash = key.hashCode();
                         int keyGroup = MathUtils.murmurHash(hash) % maxParallel;
                         int targetSubpartition = keyGroup * parallel / maxParallel;
                         return targetSubpartition == subtaskIndex;
@@ -323,54 +328,13 @@ public class TiKVRichParallelSourceFunction<T> extends RichParallelSourceFunctio
         return resp.getSafePoint();
     }
 
-    private Object getRowKey(
-            byte[] value, Long handle, TiTableInfo tableInfo, TiColumnInfo primaryColumn) {
-        if (value.length == 0) {
-            throw new CodecException("Decode fails: value length is zero");
-        }
-        if (handle == null && tableInfo.isPkHandle()) {
-            throw new IllegalArgumentException("when pk is handle, handle cannot be null");
-        }
-        Object pk = null;
-        if ((value[0] & 0xff) == RowV2.CODEC_VER) {
-            // decode bytes
-            RowV2 rowV2 = RowV2.createNew(value);
-            RowV2.ColIDSearchResult searchResult = rowV2.findColID(primaryColumn.getId());
-
-            // corresponding column should be found
-            byte[] colData = rowV2.getData(searchResult.getIdx());
-            pk = RowDecoderV2.decodeCol(colData, primaryColumn.getType());
-        } else {
-            // decode bytes
-            CodecDataInput cdi = new CodecDataInput(value);
-            if (primaryColumn.getId() == 1L) {
-                if (!cdi.eof()) {
-                    pk = primaryColumn.getType().decodeForBatchWrite(cdi);
-                }
-            } else {
-                int colSize = tableInfo.getColumns().size();
-                HashMap<Long, TiColumnInfo> idToColumn = new HashMap<>(colSize);
-                for (TiColumnInfo col : tableInfo.getColumns()) {
-                    idToColumn.put(col.getId(), col);
-                }
-                while (!cdi.eof()) {
-                    long colID = (long) IntegerType.BIGINT.decode(cdi);
-                    Object colValue = idToColumn.get(colID).getType().decodeForBatchWrite(cdi);
-                    if (colID == primaryColumn.getId()) {
-                        pk = colValue;
-                        break;
-                    }
-                }
-            }
-        }
-        return pk;
-    }
-
     private void handleRow(final Cdcpb.Event.Row row) {
         byte[] rowKey = row.getKey().toByteArray();
+        boolean isCommonHandle = tableInfo.isCommonHandle();
+        RowKey.Handle handle = RowKey.decodeHandle(rowKey, isCommonHandle);
+
         if (!TableKeyRangeUtils.isRecordKey(rowKey)
-                || !checkPartition.apply(
-                        RowKey.decode(rowKey).getHandle(), row.getValue().toByteArray())) {
+                || !checkPartition.apply(handle, row.getValue().toByteArray())) {
             //            if (!TableKeyRangeUtils.isRecordKey(row.getKey().toByteArray())) {
             // Don't handle index key for now
             return;
@@ -378,17 +342,17 @@ public class TiKVRichParallelSourceFunction<T> extends RichParallelSourceFunctio
         LOG.debug("binlog record, type: {}, data: {}", row.getType(), row);
         switch (row.getType()) {
             case COMMITTED:
-                prewrites.put(RowKeyWithTs.ofStart(row), row);
-                commits.put(RowKeyWithTs.ofCommit(row), row);
+                prewrites.put(RowKeyWithTs.ofStart(row, handle), row);
+                commits.put(RowKeyWithTs.ofCommit(row, handle), row);
                 break;
             case COMMIT:
-                commits.put(RowKeyWithTs.ofCommit(row), row);
+                commits.put(RowKeyWithTs.ofCommit(row, handle), row);
                 break;
             case PREWRITE:
-                prewrites.put(RowKeyWithTs.ofStart(row), row);
+                prewrites.put(RowKeyWithTs.ofStart(row, handle), row);
                 break;
             case ROLLBACK:
-                prewrites.remove(RowKeyWithTs.ofStart(row));
+                prewrites.remove(RowKeyWithTs.ofStart(row, handle));
                 break;
             default:
                 LOG.warn("Unsupported row type:" + row.getType());
@@ -412,10 +376,9 @@ public class TiKVRichParallelSourceFunction<T> extends RichParallelSourceFunctio
 
                 for (final Kvrpcpb.KvPair pair : segment) {
                     byte[] rowKey = pair.getKey().toByteArray();
+                    RowKey.Handle handle = RowKey.decodeHandle(rowKey, tableInfo.isCommonHandle());
                     if (TableKeyRangeUtils.isRecordKey(rowKey)
-                            && checkPartition.apply(
-                                    RowKey.decode(rowKey).getHandle(),
-                                    pair.getValue().toByteArray())) {
+                            && checkPartition.apply(handle, pair.getValue().toByteArray())) {
                         //                        if
                         // (TableKeyRangeUtils.isRecordKey(pair.getKey().toByteArray())) {
                         snapshotEventDeserializationSchema.deserialize(pair, outputCollector);
@@ -466,7 +429,12 @@ public class TiKVRichParallelSourceFunction<T> extends RichParallelSourceFunctio
             while (!commits.isEmpty() && commits.firstKey().timestamp <= timestamp) {
                 final Cdcpb.Event.Row commitRow = commits.pollFirstEntry().getValue();
                 final Cdcpb.Event.Row prewriteRow =
-                        prewrites.remove(RowKeyWithTs.ofStart(commitRow));
+                        prewrites.remove(
+                                RowKeyWithTs.ofStart(
+                                        commitRow,
+                                        RowKey.decodeHandle(
+                                                commitRow.getKey().toByteArray(),
+                                                tableInfo.isCommonHandle())));
                 // if pull cdc event block when region split, cdc event will lose.
                 committedEvents.offer(prewriteRow);
             }
@@ -539,49 +507,51 @@ public class TiKVRichParallelSourceFunction<T> extends RichParallelSourceFunctio
     // ---------------------------------------
     private static class RowKeyWithTs implements Comparable<RowKeyWithTs> {
         private final long timestamp;
-        private final RowKey rowKey;
+        private final RowKey.Handle handle;
 
-        private RowKeyWithTs(final long timestamp, final RowKey rowKey) {
+        private RowKeyWithTs(final long timestamp, final RowKey.Handle handle) {
             this.timestamp = timestamp;
-            this.rowKey = rowKey;
+            this.handle = handle;
         }
 
         private RowKeyWithTs(final long timestamp, final byte[] key) {
-            this(timestamp, RowKey.decode(key));
+            this(timestamp, RowKey.decodeHandle(key, false));
         }
 
         @Override
         public int compareTo(final RowKeyWithTs that) {
             int res = Long.compare(this.timestamp, that.timestamp);
             if (res == 0) {
-                res = Long.compare(this.rowKey.getTableId(), that.rowKey.getTableId());
-            }
-            if (res == 0) {
-                res = Long.compare(this.rowKey.getHandle(), that.rowKey.getHandle());
+                res = this.handle.compareTo(that.handle);
             }
             return res;
         }
 
         @Override
         public int hashCode() {
-            return Objects.hash(this.timestamp, this.rowKey.getTableId(), this.rowKey.getHandle());
+            if (this.handle.getIsCommonHandle()) {
+                return Objects.hash(
+                        this.timestamp, this.handle.getTableId(), this.handle.getStringHandle());
+            }
+            return Objects.hash(
+                    this.timestamp, this.handle.getTableId(), this.handle.getLongHandle());
         }
 
         @Override
         public boolean equals(final Object thatObj) {
             if (thatObj instanceof RowKeyWithTs) {
                 final RowKeyWithTs that = (RowKeyWithTs) thatObj;
-                return this.timestamp == that.timestamp && this.rowKey.equals(that.rowKey);
+                return this.timestamp == that.timestamp && this.handle.equals(that.handle);
             }
             return false;
         }
 
-        static RowKeyWithTs ofStart(final Cdcpb.Event.Row row) {
-            return new RowKeyWithTs(row.getStartTs(), row.getKey().toByteArray());
+        static RowKeyWithTs ofStart(final Cdcpb.Event.Row row, RowKey.Handle handle) {
+            return new RowKeyWithTs(row.getStartTs(), handle);
         }
 
-        static RowKeyWithTs ofCommit(final Cdcpb.Event.Row row) {
-            return new RowKeyWithTs(row.getCommitTs(), row.getKey().toByteArray());
+        static RowKeyWithTs ofCommit(final Cdcpb.Event.Row row, RowKey.Handle handle) {
+            return new RowKeyWithTs(row.getCommitTs(), handle);
         }
     }
 
