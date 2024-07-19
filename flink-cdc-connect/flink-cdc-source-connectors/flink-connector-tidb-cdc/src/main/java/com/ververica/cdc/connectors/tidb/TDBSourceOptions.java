@@ -56,6 +56,12 @@ public class TDBSourceOptions {
                     .noDefaultValue()
                     .withDescription("TiKV cluster's PD address");
 
+    public static final ConfigOption<Boolean> TIKV_REUSE_SESSION =
+            ConfigOptions.key("tikv.reuse-session")
+                    .booleanType()
+                    .defaultValue(true)
+                    .withDescription("capture data with common session");
+
     public static final ConfigOption<Long> TIKV_GRPC_TIMEOUT =
             ConfigOptions.key(ConfigUtils.TIKV_GRPC_TIMEOUT)
                     .longType()

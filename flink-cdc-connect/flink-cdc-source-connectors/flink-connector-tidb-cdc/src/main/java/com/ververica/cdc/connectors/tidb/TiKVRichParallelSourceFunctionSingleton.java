@@ -28,7 +28,6 @@ import org.apache.flink.runtime.state.FunctionSnapshotContext;
 import org.apache.flink.streaming.api.checkpoint.CheckpointedFunction;
 import org.apache.flink.streaming.api.functions.source.RichParallelSourceFunction;
 import org.apache.flink.util.Collector;
-import org.apache.flink.util.FlinkRuntimeException;
 import org.apache.flink.util.Preconditions;
 
 import org.apache.flink.shaded.guava31.com.google.common.util.concurrent.ThreadFactoryBuilder;
@@ -39,24 +38,12 @@ import com.ververica.cdc.connectors.tidb.table.StartupMode;
 import com.ververica.cdc.connectors.tidb.table.utils.TableKeyRangeUtils;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import org.tikv.cdc.CDCClient;
-import org.tikv.common.PDClient;
 import org.tikv.common.TiConfiguration;
-import org.tikv.common.TiSession;
 import org.tikv.common.key.RowKey;
 import org.tikv.common.meta.TiTableInfo;
-import org.tikv.common.operation.PDErrorHandler;
-import org.tikv.common.util.ConcreteBackOffer;
 import org.tikv.kvproto.Cdcpb;
-import org.tikv.kvproto.Coprocessor;
 import org.tikv.kvproto.Kvrpcpb;
-import org.tikv.kvproto.PDGrpc;
-import org.tikv.kvproto.Pdpb;
-import org.tikv.shade.com.google.protobuf.ByteString;
-import org.tikv.txn.KVClient;
 
-import java.lang.reflect.Field;
-import java.util.List;
 import java.util.Objects;
 import java.util.TreeMap;
 import java.util.concurrent.BlockingQueue;
@@ -65,34 +52,23 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.TimeUnit;
-import java.util.function.Supplier;
-
-import static org.tikv.common.pd.PDError.buildFromPdpbError;
 
 /**
  * The source implementation for TiKV that read snapshot events first and then read the change
  * event.
  */
-public class TiKVRichParallelSourceFunction<T> extends RichParallelSourceFunction<T>
+public class TiKVRichParallelSourceFunctionSingleton<T> extends RichParallelSourceFunction<T>
         implements CheckpointListener, CheckpointedFunction, ResultTypeQueryable<T> {
 
     private static final long serialVersionUID = 1L;
-    private static final Logger LOG = LoggerFactory.getLogger(TiKVRichParallelSourceFunction.class);
-    private static final long SNAPSHOT_VERSION_EPOCH = -1L;
-    private static final long STREAMING_VERSION_START_EPOCH = 0L;
+    private static final Logger LOG =
+            LoggerFactory.getLogger(TiKVRichParallelSourceFunctionSingleton.class);
 
     private final TiKVSnapshotEventDeserializationSchema<T> snapshotEventDeserializationSchema;
     private final TiKVChangeEventDeserializationSchema<T> changeEventDeserializationSchema;
     private final TiConfiguration tiConf;
     private final StartupMode startupMode;
-    private final String database;
-    private final String tableName;
 
-    /** Task local variables. */
-    private transient TiSession session = null;
-
-    private transient Coprocessor.KeyRange keyRange = null;
-    private transient CDCClient cdcClient = null;
     private transient SourceContext<T> sourceContext = null;
     private transient volatile long resolvedTs = -1L;
     private transient TreeMap<RowKeyWithTs, Cdcpb.Event.Row> prewrites = null;
@@ -109,10 +85,9 @@ public class TiKVRichParallelSourceFunction<T> extends RichParallelSourceFunctio
     private static final long CLOSE_TIMEOUT = 30L;
 
     private final TiTableInfo tableInfo;
-    //    private final Long tableId;
     protected transient TargetPartitionFilter partitionFilter;
 
-    public TiKVRichParallelSourceFunction(
+    public TiKVRichParallelSourceFunctionSingleton(
             TiKVSnapshotEventDeserializationSchema<T> snapshotEventDeserializationSchema,
             TiKVChangeEventDeserializationSchema<T> changeEventDeserializationSchema,
             TiConfiguration tiConf,
@@ -123,49 +98,25 @@ public class TiKVRichParallelSourceFunction<T> extends RichParallelSourceFunctio
         this.changeEventDeserializationSchema = changeEventDeserializationSchema;
         this.tiConf = tiConf;
         this.startupMode = startupMode;
-        this.database = database;
-        this.tableName = tableName;
 
-        try (final TiSession session = TiSession.create(tiConf)) {
-            tableInfo = session.getCatalog().getTable(database, tableName);
-            if (tableInfo == null) {
-                throw new RuntimeException(
-                        String.format("Table %s.%s does not exist.", database, tableName));
-            }
-            if (snapshotEventDeserializationSchema
-                    instanceof RowDataTiKVSnapshotEventDeserializationSchema) {
-                ((RowDataTiKVSnapshotEventDeserializationSchema) snapshotEventDeserializationSchema)
-                        .updateTableInfo(tableInfo);
-            }
-            if (changeEventDeserializationSchema
-                    instanceof RowDataTiKVChangeEventDeserializationSchema) {
-                ((RowDataTiKVChangeEventDeserializationSchema) changeEventDeserializationSchema)
-                        .updateTableInfo(tableInfo);
-            }
-            //            tableId = tableInfo.getId();
-        } catch (final Exception e) {
-            throw new FlinkRuntimeException(e);
+        tableInfo = TiKVSource.getTiKVSource(tiConf).getTable(database, tableName);
+
+        if (snapshotEventDeserializationSchema
+                instanceof RowDataTiKVSnapshotEventDeserializationSchema) {
+            ((RowDataTiKVSnapshotEventDeserializationSchema) snapshotEventDeserializationSchema)
+                    .updateTableInfo(tableInfo);
+        }
+        if (changeEventDeserializationSchema
+                instanceof RowDataTiKVChangeEventDeserializationSchema) {
+            ((RowDataTiKVChangeEventDeserializationSchema) changeEventDeserializationSchema)
+                    .updateTableInfo(tableInfo);
         }
     }
 
     @Override
     public void open(final Configuration config) throws Exception {
         super.open(config);
-        session = TiSession.create(tiConf);
-        //        TiTableInfo tableInfo = session.getCatalog().getTable(database, tableName);
-        //        if (tableInfo == null) {
-        //            throw new RuntimeException(
-        //                    String.format("Table %s.%s does not exist.", database, tableName));
-        //        }
-        //        long tableId = tableInfo.getId();
 
-        keyRange = TableKeyRangeUtils.getTableKeyRange(tableInfo.getId(), 1, 0);
-        //        keyRange =
-        //                TableKeyRangeUtils.getTableKeyRange(
-        //                        tableId,
-        //                        getRuntimeContext().getNumberOfParallelSubtasks(),
-        //                        getRuntimeContext().getIndexOfThisSubtask());
-        cdcClient = new CDCClient(session, keyRange);
         prewrites = new TreeMap<>();
         commits = new TreeMap<>();
         // cdc event will lose if pull cdc event block when region split
@@ -175,12 +126,13 @@ public class TiKVRichParallelSourceFunction<T> extends RichParallelSourceFunctio
         outputCollector = new OutputCollector<>();
         resolvedTs =
                 startupMode == StartupMode.INITIAL
-                        ? SNAPSHOT_VERSION_EPOCH
-                        : STREAMING_VERSION_START_EPOCH;
+                        ? TiKVSource.SNAPSHOT_VERSION_EPOCH
+                        : TiKVSource.STREAMING_VERSION_START_EPOCH;
         ThreadFactory threadFactory =
                 new ThreadFactoryBuilder()
                         .setNameFormat(
-                                "tidb-source-function-"
+                                tableInfo.getName()
+                                        + "-tidb-source-function-"
                                         + getRuntimeContext().getIndexOfThisSubtask())
                         .build();
         executorService = Executors.newSingleThreadExecutor(threadFactory);
@@ -189,7 +141,6 @@ public class TiKVRichParallelSourceFunction<T> extends RichParallelSourceFunctio
         int maxParallel = getRuntimeContext().getMaxNumberOfParallelSubtasks();
         int parallel = getRuntimeContext().getNumberOfParallelSubtasks();
         int subtaskIndex = getRuntimeContext().getIndexOfThisSubtask();
-
         partitionFilter = new TargetPartitionFilter(maxParallel, parallel, subtaskIndex, tableInfo);
     }
 
@@ -198,46 +149,22 @@ public class TiKVRichParallelSourceFunction<T> extends RichParallelSourceFunctio
         sourceContext = ctx;
         outputCollector.context = sourceContext;
 
+        TiKVSource tiKVSource = TiKVSource.getTiKVSource(tiConf);
         if (startupMode == StartupMode.INITIAL) {
             synchronized (sourceContext.getCheckpointLock()) {
-                readSnapshotEvents();
+                LOG.info("read snapshot events");
+                resolvedTs = tiKVSource.scanTable(tableInfo, this::sinkSnapshotEvents);
             }
         } else {
             LOG.info("Skip snapshot read");
-            resolvedTs = session.getTimestamp().getVersion();
-            //            resolvedTs = getGcSafePoint();
+            resolvedTs = tiKVSource.getResolvedTs();
         }
-
         LOG.info("start read change events");
-        cdcClient.start(resolvedTs);
         running = true;
-        readChangeEvents();
-    }
+        sinkChangeEventsAsync();
 
-    public long getGcSafePoint() throws NoSuchFieldException, IllegalAccessException {
-        PDClient client = session.getPDClient();
-        Field headerField = PDClient.class.getDeclaredField("header");
-        headerField.setAccessible(true);
-        Pdpb.RequestHeader header = (Pdpb.RequestHeader) headerField.get(client);
-
-        Supplier<Pdpb.GetGCSafePointRequest> request =
-                () -> Pdpb.GetGCSafePointRequest.newBuilder().setHeader(header).build();
-        PDErrorHandler<Pdpb.GetGCSafePointResponse> handler =
-                new PDErrorHandler<>(
-                        r ->
-                                r.getHeader().hasError()
-                                        ? buildFromPdpbError(r.getHeader().getError())
-                                        : null,
-                        session.getPDClient());
-
-        Pdpb.GetGCSafePointResponse resp =
-                client.callWithRetry(
-                        ConcreteBackOffer.newTsoBackOff(),
-                        PDGrpc.getGetGCSafePointMethod(),
-                        request,
-                        handler);
-
-        return resp.getSafePoint();
+        tiKVSource.captureChangeData(
+                tableInfo, resolvedTs, this::handleRow, this::advanceResolvedTs);
     }
 
     private void handleRow(final Cdcpb.Event.Row row) {
@@ -247,7 +174,6 @@ public class TiKVRichParallelSourceFunction<T> extends RichParallelSourceFunctio
 
         if (!TableKeyRangeUtils.isRecordKey(rowKey)
                 || !partitionFilter.filter(handle, row.getValue().toByteArray())) {
-            //            if (!TableKeyRangeUtils.isRecordKey(row.getKey().toByteArray())) {
             // Don't handle index key for now
             return;
         }
@@ -271,42 +197,20 @@ public class TiKVRichParallelSourceFunction<T> extends RichParallelSourceFunctio
         }
     }
 
-    protected void readSnapshotEvents() throws Exception {
-        LOG.info("read snapshot events");
-        try (KVClient scanClient = session.createKVClient()) {
-            //            long startTs = session.getTimestamp().getVersion();
-            long startTs = getGcSafePoint();
-            ByteString start = keyRange.getStart();
-            while (true) {
-                final List<Kvrpcpb.KvPair> segment =
-                        scanClient.scan(start, keyRange.getEnd(), startTs);
-
-                if (segment.isEmpty()) {
-                    resolvedTs = startTs;
-                    break;
-                }
-
-                for (final Kvrpcpb.KvPair pair : segment) {
-                    byte[] rowKey = pair.getKey().toByteArray();
-                    RowKey.Handle handle = RowKey.decodeHandle(rowKey, tableInfo.isCommonHandle());
-                    if (TableKeyRangeUtils.isRecordKey(rowKey)
-                            && partitionFilter.filter(handle, pair.getValue().toByteArray())) {
-                        //                        if
-                        // (TableKeyRangeUtils.isRecordKey(pair.getKey().toByteArray())) {
-                        snapshotEventDeserializationSchema.deserialize(pair, outputCollector);
-                    }
-                }
-
-                start =
-                        RowKey.toRawKey(segment.get(segment.size() - 1).getKey())
-                                .next()
-                                .toByteString();
+    protected void sinkSnapshotEvents(Kvrpcpb.KvPair pair) {
+        byte[] rowKey = pair.getKey().toByteArray();
+        RowKey.Handle handle = RowKey.decodeHandle(rowKey, tableInfo.isCommonHandle());
+        if (TableKeyRangeUtils.isRecordKey(rowKey)
+                && partitionFilter.filter(handle, pair.getValue().toByteArray())) {
+            try {
+                snapshotEventDeserializationSchema.deserialize(pair, outputCollector);
+            } catch (Exception e) {
+                throw new RuntimeException(e);
             }
         }
     }
 
-    protected void readChangeEvents() throws Exception {
-        LOG.info("read change event from resolvedTs:{}", resolvedTs);
+    protected void sinkChangeEventsAsync() {
         // child thread to sink committed rows.
         executorService.execute(
                 () -> {
@@ -320,17 +224,15 @@ public class TiKVRichParallelSourceFunction<T> extends RichParallelSourceFunctio
                         }
                     }
                 });
-        while (resolvedTs >= STREAMING_VERSION_START_EPOCH) {
-            for (int i = 0; i < 1000; i++) {
-                final Cdcpb.Event.Row row = cdcClient.get();
-                if (row == null) {
-                    break;
-                }
-                handleRow(row);
-            }
-            resolvedTs = cdcClient.getMaxResolvedTs();
-            if (commits.size() > 0) {
+    }
+
+    protected void advanceResolvedTs(Long resolvedTs) {
+        this.resolvedTs = resolvedTs;
+        if (!commits.isEmpty()) {
+            try {
                 flushRows(resolvedTs);
+            } catch (Exception e) {
+                throw new RuntimeException(e);
             }
         }
     }
@@ -357,9 +259,7 @@ public class TiKVRichParallelSourceFunction<T> extends RichParallelSourceFunctio
     public void cancel() {
         try {
             running = false;
-            if (cdcClient != null) {
-                cdcClient.close();
-            }
+            TiKVSource.getTiKVSource(tiConf).cancelCaptureChangeData(tableInfo);
             if (executorService != null) {
                 executorService.shutdown();
                 if (!executorService.awaitTermination(CLOSE_TIMEOUT, TimeUnit.SECONDS)) {

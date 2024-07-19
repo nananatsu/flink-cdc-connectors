@@ -28,15 +28,14 @@ import org.apache.flink.table.types.logical.LogicalType;
 import org.apache.flink.table.types.logical.LogicalTypeRoot;
 import org.apache.flink.table.types.logical.RowType;
 import org.apache.flink.util.Collector;
-import org.apache.flink.util.FlinkRuntimeException;
 
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.ververica.cdc.connectors.tidb.TiKVSource;
 import com.ververica.cdc.debezium.utils.TemporalConversions;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.tikv.common.TiConfiguration;
-import org.tikv.common.TiSession;
 import org.tikv.common.meta.TiColumnInfo;
 import org.tikv.common.meta.TiTableInfo;
 import org.tikv.kvproto.Kvrpcpb;
@@ -47,6 +46,7 @@ import java.nio.ByteBuffer;
 import java.sql.Timestamp;
 import java.util.List;
 import java.util.Map;
+import java.util.stream.Collectors;
 
 import static org.apache.flink.util.Preconditions.checkNotNull;
 
@@ -96,11 +96,12 @@ public class RowDataTiKVEventDeserializationSchemaBase implements Serializable {
     }
 
     protected TiTableInfo fetchTableInfo() {
-        try (final TiSession session = TiSession.create(tiConf)) {
-            return session.getCatalog().getTable(database, tableName);
-        } catch (final Exception e) {
-            throw new FlinkRuntimeException(e);
-        }
+        return TiKVSource.getTiKVSource(tiConf).getTable(database, tableName);
+        //        try (final TiSession session = TiSession.create(tiConf)) {
+        //            return session.getCatalog().getTable(database, tableName);
+        //        } catch (final Exception e) {
+        //            throw new FlinkRuntimeException(e);
+        //        }
     }
 
     public void updateTableInfo(TiTableInfo info) {
@@ -234,6 +235,22 @@ public class RowDataTiKVEventDeserializationSchemaBase implements Serializable {
                                                             new TypeReference<
                                                                     List<Map<String, String>>>() {})
                                                     .stream()
+                                                    .map(
+                                                            map ->
+                                                                    map.entrySet().stream()
+                                                                            .collect(
+                                                                                    Collectors
+                                                                                            .toMap(
+                                                                                                    entry ->
+                                                                                                            StringData
+                                                                                                                    .fromString(
+                                                                                                                            entry
+                                                                                                                                    .getKey()),
+                                                                                                    entry ->
+                                                                                                            StringData
+                                                                                                                    .fromString(
+                                                                                                                            entry
+                                                                                                                                    .getValue()))))
                                                     .map(GenericMapData::new)
                                                     .toArray(GenericMapData[]::new));
                                 }
@@ -276,9 +293,20 @@ public class RowDataTiKVEventDeserializationSchemaBase implements Serializable {
                                     org.tikv.common.types.DataType dataType)
                                     throws Exception {
                                 return new GenericMapData(
-                                        mapper.readValue(
-                                                (String) object,
-                                                new TypeReference<Map<String, String>>() {}));
+                                        mapper
+                                                .readValue(
+                                                        (String) object,
+                                                        new TypeReference<Map<String, String>>() {})
+                                                .entrySet().stream()
+                                                .collect(
+                                                        Collectors.toMap(
+                                                                entry ->
+                                                                        StringData.fromString(
+                                                                                entry.getKey()),
+                                                                entry ->
+                                                                        StringData.fromString(
+                                                                                entry
+                                                                                        .getValue()))));
                             }
                         };
                     default:

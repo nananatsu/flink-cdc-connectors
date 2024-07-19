@@ -39,6 +39,7 @@ import java.util.Objects;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
+import static com.ververica.cdc.connectors.tidb.TDBSourceOptions.TIKV_REUSE_SESSION;
 import static org.apache.flink.util.Preconditions.checkNotNull;
 
 /**
@@ -122,8 +123,11 @@ public class TiDBTableSource implements ScanTableSource, SupportsReadingMetadata
                         .tableName(tableName)
                         .startupOptions(startupOptions)
                         .tiConf(tiConf)
+                        .reuseTiKVSession(
+                                Boolean.parseBoolean(options.get(TIKV_REUSE_SESSION.key())))
                         .snapshotEventDeserializer(snapshotEventDeserializationSchema)
                         .changeEventDeserializer(changeEventDeserializationSchema);
+
         return SourceFunctionProvider.of(builder.build(), false);
     }
 

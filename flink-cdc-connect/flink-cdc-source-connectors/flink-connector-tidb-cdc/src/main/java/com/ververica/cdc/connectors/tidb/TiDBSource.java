@@ -32,6 +32,7 @@ public class TiDBSource {
     public static class Builder<T> {
         private String database;
         private String tableName;
+        private Boolean reuseTiKVSession;
         private StartupOptions startupOptions = StartupOptions.initial();
         private TiConfiguration tiConf;
 
@@ -76,8 +77,22 @@ public class TiDBSource {
             return this;
         }
 
-        public RichParallelSourceFunction<T> build() {
+        /** reuse tikv session. */
+        public Builder<T> reuseTiKVSession(boolean reuseTiKVSession) {
+            this.reuseTiKVSession = reuseTiKVSession;
+            return this;
+        }
 
+        public RichParallelSourceFunction<T> build() {
+            if (reuseTiKVSession) {
+                return new TiKVRichParallelSourceFunctionSingleton<>(
+                        snapshotEventDeserializationSchema,
+                        changeEventDeserializationSchema,
+                        tiConf,
+                        startupOptions.startupMode,
+                        database,
+                        tableName);
+            }
             return new TiKVRichParallelSourceFunction<>(
                     snapshotEventDeserializationSchema,
                     changeEventDeserializationSchema,
