@@ -248,9 +248,9 @@ public class TiKVRichParallelSourceFunction<T> extends RichParallelSourceFunctio
 
         byte[] rowValue;
         if (row.getOpType() == DELETE) {
-            rowValue = row.getValue().toByteArray();
-        } else {
             rowValue = row.getOldValue().toByteArray();
+        } else {
+            rowValue = row.getValue().toByteArray();
         }
         if (!TableKeyRangeUtils.isRecordKey(rowKey) || !partitionFilter.filter(handle, rowValue)) {
             //            if (!TableKeyRangeUtils.isRecordKey(row.getKey().toByteArray())) {
