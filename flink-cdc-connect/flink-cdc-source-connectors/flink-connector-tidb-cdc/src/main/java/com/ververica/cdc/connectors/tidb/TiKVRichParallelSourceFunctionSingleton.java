@@ -53,6 +53,8 @@ import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.TimeUnit;
 
+import static org.tikv.kvproto.Cdcpb.Event.Row.OpType.DELETE;
+
 /**
  * The source implementation for TiKV that read snapshot events first and then read the change
  * event.
@@ -172,8 +174,14 @@ public class TiKVRichParallelSourceFunctionSingleton<T> extends RichParallelSour
         boolean isCommonHandle = tableInfo.isCommonHandle();
         RowKey.Handle handle = RowKey.decodeHandle(rowKey, isCommonHandle);
 
-        if (!TableKeyRangeUtils.isRecordKey(rowKey)
-                || !partitionFilter.filter(handle, row.getValue().toByteArray())) {
+        byte[] rowValue;
+        if (row.getOpType() == DELETE) {
+            rowValue = row.getOldValue().toByteArray();
+        } else {
+            rowValue = row.getValue().toByteArray();
+        }
+
+        if (!TableKeyRangeUtils.isRecordKey(rowKey) || !partitionFilter.filter(handle, rowValue)) {
             // Don't handle index key for now
             return;
         }
