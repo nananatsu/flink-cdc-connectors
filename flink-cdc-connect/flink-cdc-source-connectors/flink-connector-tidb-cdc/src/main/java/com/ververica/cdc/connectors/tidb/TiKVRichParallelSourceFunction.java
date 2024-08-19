@@ -68,6 +68,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.function.Supplier;
 
 import static org.tikv.common.pd.PDError.buildFromPdpbError;
+import static org.tikv.kvproto.Cdcpb.Event.Row.OpType.DELETE;
 
 /**
  * The source implementation for TiKV that read snapshot events first and then read the change
@@ -245,8 +246,13 @@ public class TiKVRichParallelSourceFunction<T> extends RichParallelSourceFunctio
         boolean isCommonHandle = tableInfo.isCommonHandle();
         RowKey.Handle handle = RowKey.decodeHandle(rowKey, isCommonHandle);
 
-        if (!TableKeyRangeUtils.isRecordKey(rowKey)
-                || !partitionFilter.filter(handle, row.getValue().toByteArray())) {
+        byte[] rowValue;
+        if (row.getOpType() == DELETE) {
+            rowValue = row.getValue().toByteArray();
+        } else {
+            rowValue = row.getOldValue().toByteArray();
+        }
+        if (!TableKeyRangeUtils.isRecordKey(rowKey) || !partitionFilter.filter(handle, rowValue)) {
             //            if (!TableKeyRangeUtils.isRecordKey(row.getKey().toByteArray())) {
             // Don't handle index key for now
             return;
