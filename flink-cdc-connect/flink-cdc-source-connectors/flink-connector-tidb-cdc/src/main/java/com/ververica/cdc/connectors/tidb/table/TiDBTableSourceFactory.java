@@ -32,8 +32,10 @@ import java.util.HashSet;
 import java.util.Map;
 import java.util.Set;
 
+import static com.ververica.cdc.connectors.tidb.TDBSourceOptions.CHANGELOG_MODE;
 import static com.ververica.cdc.connectors.tidb.TDBSourceOptions.DATABASE_NAME;
 import static com.ververica.cdc.connectors.tidb.TDBSourceOptions.PD_ADDRESSES;
+import static com.ververica.cdc.connectors.tidb.TDBSourceOptions.REUSE_SESSION;
 import static com.ververica.cdc.connectors.tidb.TDBSourceOptions.SCAN_STARTUP_MODE;
 import static com.ververica.cdc.connectors.tidb.TDBSourceOptions.TABLE_NAME;
 import static com.ververica.cdc.connectors.tidb.TDBSourceOptions.TIKV_BATCH_GET_CONCURRENCY;
@@ -56,6 +58,9 @@ public class TiDBTableSourceFactory implements DynamicTableSourceFactory {
         String databaseName = config.get(DATABASE_NAME);
         String tableName = config.get(TABLE_NAME);
         String pdAddresses = config.get(PD_ADDRESSES);
+        Boolean reuseSession = config.get(REUSE_SESSION);
+        String changelogMode = config.get(CHANGELOG_MODE);
+
         StartupOptions startupOptions = getStartupOptions(config);
         ResolvedSchema physicalSchema =
                 getPhysicalSchema(context.getCatalogTable().getResolvedSchema());
@@ -68,6 +73,8 @@ public class TiDBTableSourceFactory implements DynamicTableSourceFactory {
                 tableName,
                 pdAddresses,
                 startupOptions,
+                reuseSession,
+                changelogMode,
                 TiKVOptions.getTiKVOptions(context.getCatalogTable().getOptions()));
     }
 
@@ -89,6 +96,8 @@ public class TiDBTableSourceFactory implements DynamicTableSourceFactory {
     public Set<ConfigOption<?>> optionalOptions() {
         Set<ConfigOption<?>> options = new HashSet<>();
         options.add(SCAN_STARTUP_MODE);
+        options.add(CHANGELOG_MODE);
+        options.add(REUSE_SESSION);
         options.add(TIKV_GRPC_TIMEOUT);
         options.add(TIKV_GRPC_SCAN_TIMEOUT);
         options.add(TIKV_BATCH_GET_CONCURRENCY);

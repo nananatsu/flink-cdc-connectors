@@ -39,7 +39,6 @@ import java.util.Objects;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
-import static com.ververica.cdc.connectors.tidb.TDBSourceOptions.TIKV_REUSE_SESSION;
 import static org.apache.flink.util.Preconditions.checkNotNull;
 
 /**
@@ -52,6 +51,8 @@ public class TiDBTableSource implements ScanTableSource, SupportsReadingMetadata
     private final String database;
     private final String tableName;
     private final String pdAddresses;
+    private final Boolean reuseSession;
+    private final String changelogMode;
     private final StartupOptions startupOptions;
     private final Map<String, String> options;
 
@@ -72,11 +73,33 @@ public class TiDBTableSource implements ScanTableSource, SupportsReadingMetadata
             String pdAddresses,
             StartupOptions startupOptions,
             Map<String, String> options) {
+        this(
+                physicalSchema,
+                database,
+                tableName,
+                pdAddresses,
+                startupOptions,
+                true,
+                "upsert",
+                options);
+    }
+
+    public TiDBTableSource(
+            ResolvedSchema physicalSchema,
+            String database,
+            String tableName,
+            String pdAddresses,
+            StartupOptions startupOptions,
+            Boolean reuseSession,
+            String changelogMode,
+            Map<String, String> options) {
         this.physicalSchema = physicalSchema;
         this.database = checkNotNull(database);
         this.tableName = checkNotNull(tableName);
         this.pdAddresses = checkNotNull(pdAddresses);
         this.startupOptions = startupOptions;
+        this.reuseSession = reuseSession;
+        this.changelogMode = changelogMode;
         this.producedDataType = physicalSchema.toPhysicalRowDataType();
         this.options = options;
         this.metadataKeys = Collections.emptyList();
@@ -84,6 +107,9 @@ public class TiDBTableSource implements ScanTableSource, SupportsReadingMetadata
 
     @Override
     public ChangelogMode getChangelogMode() {
+        if (Objects.equals(changelogMode, "insert-only")) {
+            return ChangelogMode.insertOnly();
+        }
         return ChangelogMode.newBuilder()
                 .addContainedKind(RowKind.INSERT)
                 .addContainedKind(RowKind.UPDATE_AFTER)
@@ -123,8 +149,7 @@ public class TiDBTableSource implements ScanTableSource, SupportsReadingMetadata
                         .tableName(tableName)
                         .startupOptions(startupOptions)
                         .tiConf(tiConf)
-                        .reuseTiKVSession(
-                                Boolean.parseBoolean(options.get(TIKV_REUSE_SESSION.key())))
+                        .reuseTiKVSession(reuseSession)
                         .snapshotEventDeserializer(snapshotEventDeserializationSchema)
                         .changeEventDeserializer(changeEventDeserializationSchema);
 
@@ -135,7 +160,14 @@ public class TiDBTableSource implements ScanTableSource, SupportsReadingMetadata
     public DynamicTableSource copy() {
         TiDBTableSource source =
                 new TiDBTableSource(
-                        physicalSchema, database, tableName, pdAddresses, startupOptions, options);
+                        physicalSchema,
+                        database,
+                        tableName,
+                        pdAddresses,
+                        startupOptions,
+                        reuseSession,
+                        changelogMode,
+                        options);
         source.producedDataType = producedDataType;
         source.metadataKeys = metadataKeys;
         return source;

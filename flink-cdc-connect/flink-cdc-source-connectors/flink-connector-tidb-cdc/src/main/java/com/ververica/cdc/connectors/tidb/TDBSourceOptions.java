@@ -56,8 +56,14 @@ public class TDBSourceOptions {
                     .noDefaultValue()
                     .withDescription("TiKV cluster's PD address");
 
-    public static final ConfigOption<Boolean> TIKV_REUSE_SESSION =
-            ConfigOptions.key("tikv.reuse-session")
+    public static final ConfigOption<String> CHANGELOG_MODE =
+            ConfigOptions.key("changelog-mode")
+                    .stringType()
+                    .defaultValue("upsert")
+                    .withDescription("set table changelog mode: upsert、insert-only");
+
+    public static final ConfigOption<Boolean> REUSE_SESSION =
+            ConfigOptions.key("reuse-session")
                     .booleanType()
                     .defaultValue(true)
                     .withDescription("capture data with common session");
